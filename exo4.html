@@ -7,8 +7,8 @@
 <style>
   svg { border: 1px solid #ccc; }
   .link { stroke: #999; stroke-opacity: 0.6; }
-  .node circle { stroke: white; stroke-width: 1.5; }
-  .node text { font-size: 12px; fill: black; text-anchor: middle; }
+  .node .ring { fill: none; stroke: #333; stroke-width: 0.8; }
+  .node text { font: bold 6px sans-serif; fill: #222; text-anchor: middle; }
 </style>
 </head>
 <body>
@@ -36,6 +36,25 @@ function parsePajek(text) {
     }
   });
   return { nodes, links };
+}
+
+// Logos: country code in the dataset -> flag code on flagcdn.com
+const FLAGS = {
+  ARG: "ar", AUT: "at", BEL: "be", BGR: "bg", BRA: "br", CHE: "ch", CHL: "cl",
+  CMR: "cm", COL: "co", DEU: "de", DNK: "dk", ESP: "es", FRA: "fr", GBR: "gb-eng",
+  GRE: "gr", HRV: "hr", IRN: "ir", ITA: "it", JAM: "jm", JPN: "jp", KOR: "kr",
+  MAR: "ma", MEX: "mx", NGA: "ng", NLD: "nl", NOR: "no", PRT: "pt", PRY: "py",
+  ROM: "ro", SCO: "gb-sct", TUN: "tn", TUR: "tr", USA: "us", ZAF: "za"
+};
+
+// Yugoslavia no longer exists, so its 1998 flag (blue / white / red) is drawn here
+const YUG_FLAG = "data:image/svg+xml," + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3 3">' +
+  '<rect width="3" height="1" fill="#0c4076"/><rect y="1" width="3" height="1" fill="#fff"/>' +
+  '<rect y="2" width="3" height="1" fill="#c6363c"/></svg>');
+
+function flagUrl(code) {
+  return FLAGS[code] ? `https://flagcdn.com/${FLAGS[code]}.svg` : YUG_FLAG;
 }
 
 // Dataset (1998 World Cup football network, Pajek format), included here
@@ -207,53 +226,95 @@ function draw(text) {
     .enter()
     .append("line")
     .attr("class", "link")
-    .attr("stroke-width", d => Math.sqrt(d.weight));
+    .attr("stroke-width", d => 0.6 * Math.sqrt(d.weight));
 
-  // Nodes: a <g> with a circle + label, so the label always follows its circle
+  // Logos are kept SMALL on purpose: in the overview they are hard to read,
+  // under the fisheye lens they become big and clear.
+  const LOGO_R = 7;
+
+  // One round clip shape shared by every logo (each node is centred on 0,0)
+  svg.append("defs").append("clipPath")
+    .attr("id", "logoClip")
+    .append("circle")
+    .attr("r", LOGO_R);
+
+  // Nodes: a <g> with the logo + label, so the label always follows its logo
   const node = graphGroup.selectAll(".node")
     .data(nodes)
     .enter()
     .append("g")
     .attr("class", "node");
 
-  // Same style as the Observable reference: one colour per country, radius 5
-  const color = d3.scaleOrdinal(d3.schemeCategory10);
+  node.append("title").text(d => d.label);   // name on hover
 
-  node.append("circle")
-    .attr("r", 5)
-    .attr("fill", d => color(d.id));
+  node.append("circle")                      // grey background if the flag can't load
+    .attr("r", LOGO_R)
+    .attr("fill", "#ccc");
 
-  node.append("text")
-    .attr("x", 6)
-    .attr("y", 6)
+  node.append("image")                       // the flag, cut into a circle
+    .attr("href", d => flagUrl(d.label))
+    .attr("x", -LOGO_R).attr("y", -LOGO_R)
+    .attr("width", 2 * LOGO_R).attr("height", 2 * LOGO_R)
+    .attr("preserveAspectRatio", "xMidYMid slice")
+    .attr("clip-path", "url(#logoClip)");
+
+  node.append("circle")                      // thin border around the logo
+    .attr("class", "ring")
+    .attr("r", LOGO_R);
+
+  node.append("text")                        // label under the logo
+    .attr("y", LOGO_R + 6)
     .text(d => d.label);
 
   // ---------- 4.2 Force-directed layout (task 12) ----------
+  // Compact layout so the overview is crowded and the fisheye is useful.
   // Try other values: distance 80 / strength -250 (exercise 3) vs 40 / -400
   const simulation = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(links).id(d => d.id).distance(40))
-    .force("charge", d3.forceManyBody().strength(-400))
+    .force("link", d3.forceLink(links).id(d => d.id).distance(30))
+    .force("charge", d3.forceManyBody().strength(-120))
     .force("center", d3.forceCenter(width / 2, height / 2))
+    .force("collide", d3.forceCollide(LOGO_R + 3))   // logos never overlap
     .on("tick", ticked);
 
   // ---------- 4.1 Fisheye (task 11) ----------
   let mouse = null;      // mouse position, null = no fisheye
   let dragging = false;  // no fisheye while dragging a node
 
-  // Returns where a node is displayed (magnified if near the mouse)
+  const radius = 80;      // size of the lens
+  const distortion = 3;   // magnification at the centre = distortion + 1 (4x)
+
+  // Returns where a node is displayed and how much it is magnified (k).
+  // Bounded fisheye: a node inside the lens always stays inside the lens,
+  // and at the border factor = 1, so there is no jump at the edge.
   function fisheye(d) {
-    if (!mouse || dragging) return { x: d.x, y: d.y };
+    if (!mouse || dragging) return { x: d.x, y: d.y, k: 1 };
     const dx = d.x - mouse[0];
     const dy = d.y - mouse[1];
     const distance = Math.sqrt(dx * dx + dy * dy);
-    const radius = 150;
-    const distortion = 2;
     if (distance < radius) {
-      const factor = 1 + distortion * (1 - distance / radius);
-      return { x: mouse[0] + dx * factor, y: mouse[1] + dy * factor };
+      const factor = (distortion + 1) / (distortion * distance / radius + 1);
+      return { x: mouse[0] + dx * factor, y: mouse[1] + dy * factor, k: factor };
     }
-    return { x: d.x, y: d.y };
+    return { x: d.x, y: d.y, k: 1 };
   }
+
+  // The magnifying glass: a ring showing the lens boundary + a handle
+  const lens = graphGroup.append("g")
+    .style("pointer-events", "none")   // let the mouse reach the nodes below
+    .style("display", "none");
+
+  lens.append("circle")                // glass
+    .attr("r", radius)
+    .attr("fill", "rgba(173, 216, 230, 0.15)")
+    .attr("stroke", "#444")
+    .attr("stroke-width", 4);
+
+  lens.append("line")                  // handle
+    .attr("x1", radius * 0.71).attr("y1", radius * 0.71)
+    .attr("x2", radius * 1.2).attr("y2", radius * 1.2)
+    .attr("stroke", "#5a3e1b")
+    .attr("stroke-width", 12)
+    .attr("stroke-linecap", "round");
 
   svg.on("mousemove", function(event) {
     mouse = d3.pointer(event, graphGroup.node());  // works even when zoomed
@@ -273,10 +334,19 @@ function draw(text) {
       .attr("x2", d => fisheye(d.target).x)
       .attr("y2", d => fisheye(d.target).y);
 
+    // nodes move AND grow inside the lens, like under a real magnifying glass
     node.attr("transform", d => {
       const p = fisheye(d);
-      return `translate(${p.x}, ${p.y})`;
+      return `translate(${p.x}, ${p.y}) scale(${p.k})`;
     });
+
+    // the lens follows the mouse (hidden when the mouse is out or while dragging)
+    if (mouse && !dragging) {
+      lens.style("display", null)
+        .attr("transform", `translate(${mouse[0]}, ${mouse[1]})`);
+    } else {
+      lens.style("display", "none");
+    }
   }
 
   // ---------- 4.4 Drag and drop (task 13) ----------
@@ -288,8 +358,12 @@ function draw(text) {
       d.fy = d.y;
     })
     .on("drag", (event, d) => {
-      d.fx = event.x;
-      d.fy = event.y;
+      // a node can't be dragged outside the visible part of the screen
+      const t = d3.zoomTransform(svg.node());
+      const [left, top] = t.invert([0, 0]);
+      const [right, bottom] = t.invert([width, height]);
+      d.fx = clamp(event.x, left + LOGO_R, right - LOGO_R);
+      d.fy = clamp(event.y, top + LOGO_R, bottom - LOGO_R);
     })
     .on("end", (event, d) => {
       dragging = false;
@@ -301,8 +375,31 @@ function draw(text) {
   node.call(drag);
 
   // ---------- 4.5 Zoom and pan (task 14) ----------
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  // Limits the pan so the box around all the nodes stays on the screen.
+  // If the graph is bigger than the screen (zoomed in), it must keep covering it.
+  function keepGraphOnScreen(transform) {
+    const pad = LOGO_R + 10;
+    const x0 = d3.min(nodes, d => d.x) - pad, x1 = d3.max(nodes, d => d.x) + pad;
+    const y0 = d3.min(nodes, d => d.y) - pad, y1 = d3.max(nodes, d => d.y) + pad;
+    const k = transform.k;
+
+    // allowed range for the translation on one axis
+    const limit = (t, a, b, size) => k * (b - a) <= size
+      ? clamp(t, -k * a, size - k * b)    // graph smaller than screen: stay fully inside
+      : clamp(t, size - k * b, -k * a);   // graph bigger than screen: no empty gap
+
+    return d3.zoomIdentity
+      .translate(limit(transform.x, x0, x1, width), limit(transform.y, y0, y1, height))
+      .scale(k);
+  }
+
   const zoom = d3.zoom()
     .scaleExtent([0.3, 5])
+    .constrain(keepGraphOnScreen)   // the graph can move, but never leaves the screen
     .on("zoom", event => {
       graphGroup.attr("transform", event.transform);
     });
